@@ -64,26 +64,60 @@ This should give us everything we need to perform all of the functionality speci
 2d. Append that grouping to a MaxHeap() called canidatesForRemoval. we sort based on bytes each Timeseries of that __name__ costs. 
 3. For {
 3a. While we are exceeding the budget for our scrape job, delete all time series that match __name__, and update the configmap `high-cardinality-metrics`, with the __name__ of the metric
+4. Update our metrics endpoint so we can alert on scrape jobs we frequently have to drop from
 
 something like this 
 ```go 
-func dropMetricsLoop(config PromTimeseriesCardinalityManagerCfg) {
-    keepMetrics := getKeepMetricsFromRules(config.promConfig) // get metrics to keep based on alerting and recording rules
-    for _, scrapeJob := range config.promConfig.ScrapeConfigs {
-        totalJobTimeseriesCount := getTotalJobTimeseriesCount(scrapeJob) // get total number of timeseries for this scrape job
-        jobTimeseriesCountBudget := config.jobTotalTimeseriesCountBudget[scrapeJob.JobName] // get budget for this scrape job
-        if totalJobTimeseriesCount <= jobTimeseriesCountBudget {
-            continue // no need to drop metrics for this scrape job
+
+func dropMetricsLoop(cfg PromTimeseriesCardinalityManagerCfg) {
+    // Initialize the keep map with metrics we want to keep based on alerting and recording rules
+    keepMetrics := getKeepMetrics(cfg.promConfig)
+
+    // Start the loop to drop metrics
+    for {
+        for _, scrapeCfg := range cfg.promConfig.ScrapeConfigs {
+            jobName := scrapeCfg.JobName
+
+            // Calculate the current number of timeseries for this job
+            currentTimeseriesCount := getCurrentTimeseriesCount(scrapeCfg)
+
+            // Check if the current number of timeseries is above the budget
+            if currentTimeseriesCount > cfg.jobTotalTimeseriesCountBudget[jobName] {
+                // Get the high-cardinality metrics for this job
+                highCardinalityMetrics := getHighCardinalityMetrics(scrapeCfg, keepMetrics, cfg.maxMetricCostInBytes)
+
+                // Sort the high-cardinality metrics by the number of bytes they cost
+                sort.Slice(highCardinalityMetrics, func(i, j int) bool {
+                    return highCardinalityMetrics[i].bytesCost > highCardinalityMetrics[j].bytesCost
+                })
+
+                // Drop metrics until we're within the budget
+                for _, metric := range highCardinalityMetrics {
+                    if currentTimeseriesCount <= cfg.jobTotalTimeseriesCountBudget[jobName] {
+                        break
+                    }
+
+                    // Update the configmap to drop this metric
+                    updateConfigMap(metric, scrapeCfg)
+
+                    // Emit a Prometheus metric for the number of metrics dropped from this scrape job
+                    prometheus.Counter("prometheus_tcm_metrics_dropped_total", "The total number of metrics dropped by the Prometheus Timeseries Cardinality Manager", prometheus.Labels{
+                        "job":    jobName,
+                        "metric": metric.metricName,
+                    }).Inc()
+
+                    // Decrement the current timeseries count and move on to the next metric
+                    currentTimeseriesCount--
+                }
+            }
         }
-        candidatesForRemoval := getMaxHeapOfMetricsToRemove(scrapeJob, keepMetrics, config.maxMetricCostInBytes) // get a heap of metrics to remove
-        for totalJobTimeseriesCount > jobTimeseriesCountBudget {
-            metricToRemove := candidatesForRemoval.Pop() // get the metric with highest cost
-            removeTimeseriesWithMetric(metricToRemove, scrapeJob) // remove all timeseries with this metric
-            totalJobTimeseriesCount-- // decrement the total timeseries count for this scrape job
-            updateHighCardinalityMetricsConfigMap(metricToRemove) // update the configmap with the dropped metric
-        }
+
+        // Sleep for the specified interval before running the loop again
+        time.Sleep(cfg.cardinalityManagerInterval)
     }
 }
+
+
 ```
 
 ## How do we Prevent metrics we drop from being scraped again?
@@ -99,10 +133,11 @@ This controller needs to be aware of two configmaps.
 1. high-cardinality-metrics
 2. prometheus-config 
 
+This controller will watch for a change in high-cardinality-metrics, and remove all of the metrics in question from the configmap for the prometheus config.
 
 
-
-## How do we assign budget? 
+## How do we assign budget?
+TBD: Not complete
 You and your team can evaluate a variety of factors such as, which metrics endpoints are we scraping that can help all components? IN the case of kubernetes for example kube-state-metrics would be a good endpoint to give a lot of budget, 
 as many people can benefit from this endpoint. 
 
